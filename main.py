@@ -1,6 +1,7 @@
 import io
 import asyncio
 import logging
+import random
 import os
 import threading
 from flask import Flask
@@ -31,20 +32,21 @@ APP_ID = 30765851
 APP_HASH = '235b0bc6f03767302dc75763508f7b75'
 BOT_TOKEN = "8575371720:AAEWWV42CGrwooM_joiJXdo2iEw2_7atyXU"
 
-# 🗄️ DATABASE SETUP
-# ==========================================
 client_mongo = MongoClient(MONGO_URI)
 db = client_mongo["telegram_bot"]
 filters_col = db["filters"]
 allow_col = db["allowed_users"]
-groups_col = db["active_groups"]
-admin_tasks_col = db["admin_tasks"]
-target_bots_col = db["target_bots"]
-replies_col = db["custom_replies"]
 
 bot_client = TelegramClient('bot_session', APP_ID, APP_HASH)
 
+# Bully Task တွေကို သိမ်းထားဖို့ Dictionary
+bot_bully_tasks = {}
+
 def bq(text): return f"<blockquote><b>{text}</b></blockquote>"
+
+def is_allowed(user_id):
+    if user_id == OWNER_ID: return True
+    return allow_col.find_one({"user_id": user_id}) is not None
 
 async def check_admin(chat_id, user_id):
     if user_id == OWNER_ID: return True
@@ -72,7 +74,7 @@ async def tag_admins(event):
     except Exception as e:
         await event.respond(bq(f"Error: {e}"))
 
-# [2] /padm - Promote Admin (Ban, Change Info, Anonymous မပေးပါ)
+# [2] /padm - Promote Admin (Fixing Argument Error)
 @bot_client.on(events.NewMessage(pattern=r'^/padm(?:@\w+)?$'))
 async def promote_admin(event):
     if not await check_admin(event.chat_id, event.sender_id): return
@@ -84,6 +86,7 @@ async def promote_admin(event):
     p_mention = f"<a href='tg://user?id={promoter.id}'>{escape_html(promoter.first_name)}</a>"
     t_mention = f"<a href='tg://user?id={target.id}'>{escape_html(target.first_name)}</a>"
     
+    # Rights Selection
     rights = ChatAdminRights(
         post_messages=True, add_admins=False, change_info=False,
         ban_users=False, anonymous=False, delete_messages=True,
@@ -91,7 +94,8 @@ async def promote_admin(event):
     )
     
     try:
-        await bot_client.edit_admin(event.chat_id, target.id, rights, "Admin")
+        # Parameter တွေကို keyword အနေနဲ့ ပေးလိုက်ရင် Error မတက်တော့ပါဘူး
+        await bot_client.edit_admin(event.chat_id, target.id, admin_rights=rights, rank="Admin")
         msg = (
             f"{p_mention} က {t_mention} သူ့ကို ADMIN ပေးထားလိုက်ပါပြီ။\n\n"
             f"သူ/သူမ၏ Admin Rights-\n"
@@ -101,9 +105,9 @@ async def promote_admin(event):
         )
         await event.respond(bq(msg), parse_mode='html')
     except Exception as e:
-        await event.respond(bq(f"Error: {e}"))
+        await event.respond(bq(f"Error: {e}"), parse_mode='html')
 
-# [3] /dadm - Dismiss Admin (User ရော Bot ပါ ဖြုတ်မယ်)
+# [3] /dadm - Dismiss Admin
 @bot_client.on(events.NewMessage(pattern=r'^/dadm(?:@\w+)?$'))
 async def demote_admin(event):
     if not await check_admin(event.chat_id, event.sender_id): return
@@ -116,13 +120,13 @@ async def demote_admin(event):
         edit_messages=False, manage_call=False
     )
     try:
-        await bot_client.edit_admin(event.chat_id, reply.sender_id, empty_rights, "")
+        await bot_client.edit_admin(event.chat_id, reply.sender_id, admin_rights=empty_rights, rank="")
         target = await reply.get_sender()
         await event.respond(bq(f"<a href='tg://user?id={target.id}'>{escape_html(target.first_name)}</a> ကို Admin အဖြစ်မှ ဖယ်ရှားလိုက်ပါပြီ။"), parse_mode='html')
     except Exception as e:
-        await event.respond(bq(f"Error: {e}"))
+        await event.respond(bq(f"Error: {e}"), parse_mode='html')
 
-# [4] /removeallow [id] - Remove from allowlist
+# [4] /removeallow [id]
 @bot_client.on(events.NewMessage(pattern=r'^/removeallow(?:@\w+)?\s+(\d+)'))
 async def remove_allow(event):
     if event.sender_id != OWNER_ID: return
@@ -131,13 +135,20 @@ async def remove_allow(event):
     if res.deleted_count > 0:
         await event.respond(bq(f"User ID {target_id} ကို ပါမစ်မပေးတော့ဘူး"), parse_mode='html')
     else:
-        await event.respond(bq("ဒီ User ID ကို List ထဲမှာ မတွေ့ပါ။"))
+        await event.respond(bq("ဒီ User ID ကို List ထဲမှာ မတွေ့ပါ။"), parse_mode='html')
 
+# [5] /b Bully - Fixed Logic
 @bot_client.on(events.NewMessage(pattern=r'^/b(?:@\w+)?$'))
 async def bot_bully(event):
-    if not is_allowed(event.sender_id): return await event.reply(bq("မင်းမှာ ဒီ Command ကို သုံးပိုင်ခွင့်မရှိဘူး။သုံးခွင့်နဲ့အသုံးပြုနည်းများအတွက် @Besties_with_BoD ကိုလာ "), parse_mode='html')
+    if not is_allowed(event.sender_id): 
+        return await event.reply(bq("မင်းမှာ ဒီ Command ကို သုံးပိုင်ခွင့်မရှိဘူး။သုံးခွင့်နဲ့အသုံးပြုနည်းများအတွက် @Besties_with_BoD ကိုလာ "), parse_mode='html')
+    
     reply = await event.get_reply_message()
-    if not reply: return await event.respond(bq("ဘယ်ကောင့်ကို ခေါင်းမဖော်နိုင်အောင် ဆဲပေးရမလဲ၊Replyပြန်လိုက် "), parse_mode='html')
+    if not reply: 
+        return await event.respond(bq("ဘယ်ကောင့်ကို ခေါင်းမဖော်နိုင်အောင် ဆဲပေးရမလဲ၊Replyပြန်လိုက် "), parse_mode='html')
+
+    try: await event.delete() # Command ကို ဖျက်တယ်
+    except: pass
 
     chat_id = event.chat_id
     t = await reply.get_sender()
@@ -145,34 +156,40 @@ async def bot_bully(event):
 
     target_id = t.id
     if target_id == OWNER_ID:
-        target_id = event.sender_id
-        t = await event.get_sender()
         await event.respond(bq("ဟိတ်ကောင် Creatorကို ပြန်ပြီးဆဲဆိုခွင့် မပေးထားဘူး🔥"), parse_mode='html')
-    else: await event.respond(bq(f"<a href='tg://user?id={target_id}'>{escape_html(t.first_name)}</a>"))
+        return
 
     bot_bully_tasks[chat_id] = True
     mention = f"<a href='tg://user?id={target_id}'>{escape_html(t.first_name)}</a>"
+    
+    # DB က စာလုံးတွေကို ယူတယ်
     words = [w.get("text") for w in filters_col.find() if w.get("text")]
-    if not words: return await event.respond(bq("DB မှာ စာလုံးမရှိသေးဘူး Chief!"))
+    if not words: 
+        return await event.respond(bq("DB (filters collection) ထဲမှာ စာလုံးမရှိသေးဘူး Chief!"))
+
+    await event.respond(bq(f"{mention} ကို ခေါင်းမဖော်နိုင်အောင် စဆဲပါပြီ။"), parse_mode='html')
 
     send_count = 0
     while bot_bully_tasks.get(chat_id):
         try: 
-            await bot_client.send_message(chat_id, bq(f"{mention} {random.choice(words)}"), reply_to=reply.id if target_id != event.sender_id else event.id, parse_mode='html')
+            await bot_client.send_message(chat_id, bq(f"{mention} {random.choice(words)}"), reply_to=reply.id, parse_mode='html')
             send_count += 1
             if send_count >= 8: 
                 await asyncio.sleep(1)
                 send_count = 0 
-            else: await asyncio.sleep(0.4) 
-        except Exception as e:
+            else: await asyncio.sleep(0.5) 
+        except Exception:
             bot_bully_tasks[chat_id] = False
             break
 
+# [6] /sb Stop Bully
 @bot_client.on(events.NewMessage(pattern=r'^/sb(?:@\w+)?$'))
 async def stop_bot_bully(event):
     if not is_allowed(event.sender_id): return
+    try: await event.delete() # Command ကို ဖျက်တယ်
+    except: pass
     bot_bully_tasks[event.chat_id] = False
-    await event.reply(bq("အခုနားဆိုလို့နားလိုက်မယ်၊စောက်ချိုးမပြေရင်ထပ်ဆဲပေးမယ်"), parse_mode='html')
+    await event.respond(bq("အခုနားဆိုလို့နားလိုက်မယ်၊စောက်ချိုးမပြေရင်ထပ်ဆဲပေးမယ်"), parse_mode='html')
 
 # ==========================================
 # 🚀 EXECUTION
@@ -180,7 +197,7 @@ async def stop_bot_bully(event):
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     await bot_client.start(bot_token=BOT_TOKEN)
-    print("✅ New Repo System Online!")
+    print("✅ BoDx System Online & Fixed!")
     await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
