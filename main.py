@@ -1,113 +1,187 @@
-import os
+import io
 import asyncio
-import re
-from datetime import datetime
-import pytz
-from telethon import TelegramClient, events
-from telethon.tl.types import ChannelParticipantsAdmins
-from html import escape as escape_html
+import logging
+import os
+import threading
+from flask import Flask
 from pymongo import MongoClient
+from telethon import TelegramClient, events, types
+from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins
+from html import escape as escape_html
 
-# --- CONFIGURATION ---
-API_ID = 30765851
-API_HASH = '235b0bc6f03767302dc75763508f7b75'
-BOT_TOKEN = "8575371720:AAEWWV42CGrwooM_joiJXdo2iEw2_7atyXU"
+# ==========================================
+# 🌐 FLASK KEEP-ALIVE
+# ==========================================
+app = Flask('')
+@app.route('/')
+def home(): return "BoDx System Active!"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# ==========================================
+# ⚙️ CONFIGURATION
+# ==========================================
 OWNER_ID = 6015356597
-TARGET_CHAT_ID = -1003806830045 
-
-# MongoDB Setup
 MONGO_URI = "mongodb+srv://khantphyoemin537_db_user:9VRKiaeZkz7rJdpz@cluster0.w6tgi8j.mongodb.net/?appName=Cluster0&tlsAllowInvalidCertificates=true"
-mongo_client = MongoClient(MONGO_URI)
-db = mongo_client["telegram_bot"]
-admin_tasks_col = db["admin_tasks"] # /done command အတွက်
+APP_ID = 30765851
+APP_HASH = '235b0bc6f03767302dc75763508f7b75'
+BOT_TOKEN = "8575371720:AAEWWV42CGrwooM_joiJXdo2iEw2_7atyXU"
 
-# Timezone & Helpers
-TZ = pytz.timezone("Asia/Yangon")
-bot_client = TelegramClient('bot_session', API_ID, API_HASH)
+# 🗄️ DATABASE SETUP
+# ==========================================
+client_mongo = MongoClient(MONGO_URI)
+db = client_mongo["telegram_bot"]
+filters_col = db["filters"]
+allow_col = db["allowed_users"]
+groups_col = db["active_groups"]
+admin_tasks_col = db["admin_tasks"]
+target_bots_col = db["target_bots"]
+replies_col = db["custom_replies"]
 
-def bq(text): 
-    return f"<blockquote><b>{text}</b></blockquote>"
+bot_client = TelegramClient('bot_session', APP_ID, APP_HASH)
 
-# Admin စစ်ဆေးသည့် Function
+def bq(text): return f"<blockquote><b>{text}</b></blockquote>"
+
 async def check_admin(chat_id, user_id):
-    if user_id == OWNER_ID: 
-        return True
+    if user_id == OWNER_ID: return True
     try:
-        admins = await bot_client.get_participants(chat_id, filter=ChannelParticipantsAdmins)
-        return any(admin.id == user_id for admin in admins)
-    except:
-        return False
+        permissions = await bot_client.get_permissions(chat_id, user_id)
+        return permissions.is_admin
+    except: return False
 
-# --- 1. BIO & LINK FILTER LOGIC ---
-@bot_client.on(events.NewMessage(chats=TARGET_CHAT_ID))
-async def filter_logic(event):
-    if not event.text: return
-    
-    sender = await event.get_sender()
-    sender_id = event.sender_id
-    text = event.text.strip()
-    
-    # Bio Filter
-    if text in ["Bio", "ဘိုင်အို", "ဘိုင်-အို"]:
-        if not await check_admin(event.chat_id, sender_id):
-            await event.delete()
-            return await event.respond(
-                bq("Bruhh bruhh bioမှာဘာဖြစ်တာလဲ မသိချင်ပါဘူး စာကိုဖျက်လိုက်ပြီ။နောက်တစ်ခါ bioရင် ဒီလိုဖြစ်မယ် 🤰🫃"),
-                parse_mode='html'
-            )
+# ==========================================
+# 🛡️ COMMANDS SYSTEM
+# ==========================================
 
-    # Link Filter
-    urls = re.findall(r'(https?://\S+|www\.\S+)', text)
-    if urls:
-        if await check_admin(event.chat_id, sender_id):
-            full_name = f"{sender.first_name} {sender.last_name or ''}".strip()
-            mention = f"<a href='tg://user?id={sender_id}'>{escape_html(full_name)}</a>"
-            all_links = "\n".join(urls)
-            reason = text
-            for u in urls: reason = reason.replace(u, "")
-
-            await event.delete()
-            admin_msg = f"Linkပို့တဲ့သူ- {mention}\nသူပို့တဲ့Link- {all_links}\nReason - {escape_html(reason.strip() or 'No message')}"
-            await event.respond(bq(admin_msg), parse_mode='html')
-        else:
-            await event.delete()
-            await event.respond(bq("ဘာ link မှမပို့နဲ့ မရဘူး၊မင်းlinkကို ငါဖျက်လိုက်ပြီ🫵"), parse_mode='html')
-
-# --- 2. ADM COMMAND (/adm) ---
-@bot_client.on(events.NewMessage(pattern=r'^/adm(?:@\w+)?(?:\s+(.*))?'))
-async def admin_mention(event):
-    if event.is_private: return
+# [1] /adm - Tag All Admins
+@bot_client.on(events.NewMessage(pattern=r'^/adm(?:\s+(.*))?'))
+async def tag_admins(event):
     if not await check_admin(event.chat_id, event.sender_id): return
-
-    input_text = event.pattern_match.group(1) if event.pattern_match.group(1) else "Attention Admins!"
-    chat_title = escape_html(event.chat.title)
-    mentions = f"<b>🛡️ {chat_title} ADMINS:</b>\n\n"
-    
+    text = event.pattern_match.group(1) or "Admins ခေါ်နေပါတယ်!"
     try:
         admins = await bot_client.get_participants(event.chat_id, filter=ChannelParticipantsAdmins)
-        for user in admins:
-            if not user.bot:
-                name = escape_html(user.first_name) if user.first_name else "Admin"
-                mentions += f"• <a href='tg://user?id={user.id}'>{name}</a>\n"
-        
-        await event.respond(bq(f"{mentions}\n💬 <b>Message:</b> {escape_html(input_text)}"), parse_mode='html')
+        msg = f"📣 {escape_html(text)}\n\n"
+        for a in admins:
+            if not a.bot:
+                msg += f"• <a href='tg://user?id={a.id}'>{escape_html(a.first_name)}</a>\n"
+        await event.respond(bq(msg), parse_mode='html')
     except Exception as e:
-        await event.respond(bq(f"Error: {str(e)}"), parse_mode='html')
+        await event.respond(bq(f"Error: {e}"))
 
-# --- 3. DONE COMMAND (/done) ---
-@bot_client.on(events.NewMessage(pattern=r'^/done(?:@\w+)?$'))
-async def admin_done(event):
+# [2] /padm - Promote Admin (Ban, Change Info, Anonymous မပေးပါ)
+@bot_client.on(events.NewMessage(pattern=r'^/padm(?:@\w+)?$'))
+async def promote_admin(event):
     if not await check_admin(event.chat_id, event.sender_id): return
+    reply = await event.get_reply_message()
+    if not reply: return await event.respond(bq("Admin ပေးချင်တဲ့သူကို Reply ထောက်ပါ။"), parse_mode='html')
     
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-    admin_tasks_col.update_one({"chat_id": event.chat_id}, {"$set": {"last_done": today}}, upsert=True)
+    promoter = await event.get_sender()
+    target = await reply.get_sender()
+    p_mention = f"<a href='tg://user?id={promoter.id}'>{escape_html(promoter.first_name)}</a>"
+    t_mention = f"<a href='tg://user?id={target.id}'>{escape_html(target.first_name)}</a>"
     
-    u = await event.get_sender()
-    name = escape_html(u.first_name) if u.first_name else "Chief"
-    await event.respond(bq(f"<a href='tg://user?id={u.id}'>{name}</a> ဟုတ်ပြီ သတိပေးတာကို ဒီနေ့အတွက် ရပ်လိုက်ပြီ"), parse_mode='html')
+    rights = ChatAdminRights(
+        post_messages=True, add_admins=False, change_info=False,
+        ban_users=False, anonymous=False, delete_messages=True,
+        invite_users=True, pin_messages=True, edit_messages=True, manage_call=True
+    )
+    
+    try:
+        await bot_client.edit_admin(event.chat_id, target.id, rights, "Admin")
+        msg = (
+            f"{p_mention} က {t_mention} သူ့ကို ADMIN ပေးထားလိုက်ပါပြီ။\n\n"
+            f"သူ/သူမ၏ Admin Rights-\n"
+            f"✅ Delete Messages\n✅ Pin Messages\n✅ Invite Users\n"
+            f"✅ Manage Video Chats\n✅ Edit Messages\n"
+            f"❌ Ban Users\n❌ Change Group Info\n❌ Remain Anonymous"
+        )
+        await event.respond(bq(msg), parse_mode='html')
+    except Exception as e:
+        await event.respond(bq(f"Error: {e}"))
 
-# --- START BOT ---
-if __name__ == '__main__':
-    print("🚀 BoDx Sovereign Family Bot is Starting on GitHub...")
-    bot_client.start(bot_token=BOT_TOKEN)
-    bot_client.run_until_disconnected()
+# [3] /dadm - Dismiss Admin (User ရော Bot ပါ ဖြုတ်မယ်)
+@bot_client.on(events.NewMessage(pattern=r'^/dadm(?:@\w+)?$'))
+async def demote_admin(event):
+    if not await check_admin(event.chat_id, event.sender_id): return
+    reply = await event.get_reply_message()
+    if not reply: return await event.respond(bq("ရာထူးဖြုတ်ချင်တဲ့သူကို Reply ထောက်ပါ။"), parse_mode='html')
+    
+    empty_rights = ChatAdminRights(
+        post_messages=False, add_admins=False, change_info=False, ban_users=False,
+        anonymous=False, delete_messages=False, invite_users=False, pin_messages=False,
+        edit_messages=False, manage_call=False
+    )
+    try:
+        await bot_client.edit_admin(event.chat_id, reply.sender_id, empty_rights, "")
+        target = await reply.get_sender()
+        await event.respond(bq(f"<a href='tg://user?id={target.id}'>{escape_html(target.first_name)}</a> ကို Admin အဖြစ်မှ ဖယ်ရှားလိုက်ပါပြီ။"), parse_mode='html')
+    except Exception as e:
+        await event.respond(bq(f"Error: {e}"))
+
+# [4] /removeallow [id] - Remove from allowlist
+@bot_client.on(events.NewMessage(pattern=r'^/removeallow(?:@\w+)?\s+(\d+)'))
+async def remove_allow(event):
+    if event.sender_id != OWNER_ID: return
+    target_id = int(event.pattern_match.group(1))
+    res = allow_col.delete_one({"user_id": target_id})
+    if res.deleted_count > 0:
+        await event.respond(bq(f"User ID {target_id} ကို ပါမစ်မပေးတော့ဘူး"), parse_mode='html')
+    else:
+        await event.respond(bq("ဒီ User ID ကို List ထဲမှာ မတွေ့ပါ။"))
+
+@bot_client.on(events.NewMessage(pattern=r'^/b(?:@\w+)?$'))
+async def bot_bully(event):
+    if not is_allowed(event.sender_id): return await event.reply(bq("မင်းမှာ ဒီ Command ကို သုံးပိုင်ခွင့်မရှိဘူး။သုံးခွင့်နဲ့အသုံးပြုနည်းများအတွက် @Besties_with_BoD ကိုလာ "), parse_mode='html')
+    reply = await event.get_reply_message()
+    if not reply: return await event.respond(bq("ဘယ်ကောင့်ကို ခေါင်းမဖော်နိုင်အောင် ဆဲပေးရမလဲ၊Replyပြန်လိုက် "), parse_mode='html')
+
+    chat_id = event.chat_id
+    t = await reply.get_sender()
+    if not t: return
+
+    target_id = t.id
+    if target_id == OWNER_ID:
+        target_id = event.sender_id
+        t = await event.get_sender()
+        await event.respond(bq("ဟိတ်ကောင် Creatorကို ပြန်ပြီးဆဲဆိုခွင့် မပေးထားဘူး🔥"), parse_mode='html')
+    else: await event.respond(bq(f"<a href='tg://user?id={target_id}'>{escape_html(t.first_name)}</a>"))
+
+    bot_bully_tasks[chat_id] = True
+    mention = f"<a href='tg://user?id={target_id}'>{escape_html(t.first_name)}</a>"
+    words = [w.get("text") for w in filters_col.find() if w.get("text")]
+    if not words: return await event.respond(bq("DB မှာ စာလုံးမရှိသေးဘူး Chief!"))
+
+    send_count = 0
+    while bot_bully_tasks.get(chat_id):
+        try: 
+            await bot_client.send_message(chat_id, bq(f"{mention} {random.choice(words)}"), reply_to=reply.id if target_id != event.sender_id else event.id, parse_mode='html')
+            send_count += 1
+            if send_count >= 8: 
+                await asyncio.sleep(1)
+                send_count = 0 
+            else: await asyncio.sleep(0.4) 
+        except Exception as e:
+            bot_bully_tasks[chat_id] = False
+            break
+
+@bot_client.on(events.NewMessage(pattern=r'^/sb(?:@\w+)?$'))
+async def stop_bot_bully(event):
+    if not is_allowed(event.sender_id): return
+    bot_bully_tasks[event.chat_id] = False
+    await event.reply(bq("အခုနားဆိုလို့နားလိုက်မယ်၊စောက်ချိုးမပြေရင်ထပ်ဆဲပေးမယ်"), parse_mode='html')
+
+# ==========================================
+# 🚀 EXECUTION
+# ==========================================
+async def main():
+    threading.Thread(target=run_flask, daemon=True).start()
+    await bot_client.start(bot_token=BOT_TOKEN)
+    print("✅ New Repo System Online!")
+    await bot_client.run_until_disconnected()
+
+if __name__ == "__main__":
+    asyncio.run(main())
